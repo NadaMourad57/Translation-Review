@@ -243,9 +243,9 @@ class TranslationEvaluatorQt(QMainWindow):
         
         self.current_sheet = self.wb[sheet_name]
         
-        # Calculate content rows
+        # Calculate content rows (all rows except header)
         max_row = self.current_sheet.max_row
-        self.max_content_rows = (max_row - 2) // 2
+        self.max_content_rows = max_row - 1
         
         self.row_spin.setMaximum(self.max_content_rows)
         self.row_spin.setValue(1)
@@ -259,8 +259,8 @@ class TranslationEvaluatorQt(QMainWindow):
         if content_row_num < 1 or content_row_num > self.max_content_rows:
             return
         
-        # Excel row: 1 + (content_row_num * 2)
-        excel_row_idx = 1 + (content_row_num * 2)
+        # Excel row: header is row 1, so content starts at row 2
+        excel_row_idx = 1 + content_row_num
         self.current_row_idx = excel_row_idx
         
         # Read content row
@@ -286,20 +286,8 @@ class TranslationEvaluatorQt(QMainWindow):
             else:
                 widget_dict['text_widget'].setPlainText("(No translation)")
         
-        # Load existing scores
-        score_row_idx = excel_row_idx + 1
-        for i, widget_dict in enumerate(self.model_widgets):
-            cell = self.current_sheet.cell(row=score_row_idx, column=i + 2)
-            if cell.value is not None:
-                try:
-                    score = int(cell.value)
-                    button = widget_dict['button_group'].button(score)
-                    if button:
-                        button.setChecked(True)
-                except:
-                    widget_dict['button_group'].button(0).setChecked(True)
-            else:
-                widget_dict['button_group'].button(0).setChecked(True)
+        # Load existing scores from JSON if available
+        self._load_scores_from_json(content_row_num - 1)
         
         # Update info
         self.info_label.setText(
@@ -312,8 +300,6 @@ class TranslationEvaluatorQt(QMainWindow):
             return
         
         try:
-            score_row_idx = self.current_row_idx + 1
-            
             # Read current row data (Source + 2 translations)
             row_data = []
             for col in range(1, 4):
@@ -350,6 +336,32 @@ class TranslationEvaluatorQt(QMainWindow):
             error_details = f"Failed to save scores:\n{str(e)}\n\nFull traceback:\n{traceback.format_exc()}"
             print(error_details)
             QMessageBox.critical(self, "Error", error_details)
+    
+    def _load_scores_from_json(self, row_index):
+        """Load existing scores from JSON files if available."""
+        sheet_name = self.current_sheet.title
+        
+        if os.path.exists(DETAILED_COMMENTS_FILE):
+            with open(DETAILED_COMMENTS_FILE, 'r', encoding='utf-8') as f:
+                detailed_comments = json.load(f)
+            
+            # Find scores for this row
+            for entry in detailed_comments:
+                if entry.get('sheet') == sheet_name and entry.get('row_index') == row_index:
+                    model = entry.get('model')
+                    score = entry.get('score', 0)
+                    
+                    # Find the widget for this model
+                    for widget_dict in self.model_widgets:
+                        if widget_dict['model'] == model:
+                            button = widget_dict['button_group'].button(score)
+                            if button:
+                                button.setChecked(True)
+                            break
+        else:
+            # No saved scores, reset to 0
+            for widget_dict in self.model_widgets:
+                widget_dict['button_group'].button(0).setChecked(True)
     
     def _save_to_json(self, english_text, translations, scores):
         """Save evaluation data to JSON files."""
