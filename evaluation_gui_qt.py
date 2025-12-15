@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """
-Qt-based Evaluation GUI for Excel files with alternating content/empty rows.
+Qt-based Evaluation GUI for Excel files with translation data.
 
 Reads Excel files where:
-- Row 1: Headers (titles)
-- Row 2: Empty
-- Row 3: 1st content (English + 4 Arabic translations)
-- Row 4: Empty (for scores)
-- Row 5: 2nd content...
+- Row 1: Headers (Source, Model 1, Model 2)
+- Row 2+: Data rows with source text and translations
 
-The GUI displays English and Arabic translations, allows scoring each of the
-4 translations, and saves scores back to the empty row below.
+Features:
+- Randomized display of translations (A/B) to prevent bias
+- Auto-save on Next when both scores are non-zero
+- LCS-based word matching to highlight common words between translations
 """
 import sys
 import json
 import os
+import random
 from pathlib import Path
 from collections import defaultdict
 
@@ -23,8 +23,8 @@ try:
                                  QHBoxLayout, QLabel, QPushButton, QComboBox, 
                                  QSpinBox, QTextEdit, QRadioButton, QButtonGroup,
                                  QFileDialog, QMessageBox, QScrollArea, QGroupBox)
-    from PyQt5.QtCore import Qt
-    from PyQt5.QtGui import QFont
+    from PyQt5.QtCore import Qt, QTimer
+    from PyQt5.QtGui import QFont, QTextCharFormat, QColor, QTextCursor
 except ImportError:
     print("ERROR: PyQt5 is required.")
     print("Install with: python -m pip install PyQt5")
@@ -50,6 +50,73 @@ MODEL_SCORES_FILE = "model_scores.json"
 DETAILED_COMMENTS_FILE = "detailed_comments.json"
 
 
+def find_lcs_words(text1, text2):
+    """
+    Find the Longest Common Subsequence of words between two texts.
+    Uses dynamic programming to find matching word sequences.
+    
+    Returns:
+        tuple: (matched_indices_text1, matched_indices_text2)
+               Lists of word indices that are part of the LCS
+    """
+    # Split texts into words (handle Arabic text properly)
+    words1 = text1.split()
+    words2 = text2.split()
+    
+    if not words1 or not words2:
+        return set(), set()
+    
+    m, n = len(words1), len(words2)
+    
+    # Build LCS table
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if words1[i-1] == words2[j-1]:
+                dp[i][j] = dp[i-1][j-1] + 1
+            else:
+                dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+    
+    # Backtrack to find matched indices
+    matched_idx1 = set()
+    matched_idx2 = set()
+    
+    i, j = m, n
+    while i > 0 and j > 0:
+        if words1[i-1] == words2[j-1]:
+            matched_idx1.add(i-1)
+            matched_idx2.add(j-1)
+            i -= 1
+            j -= 1
+        elif dp[i-1][j] > dp[i][j-1]:
+            i -= 1
+        else:
+            j -= 1
+    
+    return matched_idx1, matched_idx2
+
+
+def get_word_positions(text):
+    """
+    Get the start and end positions of each word in the text.
+    Returns list of (start, end) tuples for each word.
+    """
+    positions = []
+    words = text.split()
+    current_pos = 0
+    
+    for word in words:
+        # Find the word in the remaining text
+        start = text.find(word, current_pos)
+        if start != -1:
+            end = start + len(word)
+            positions.append((start, end))
+            current_pos = end
+    
+    return positions
+
+
 class TranslationEvaluatorQt(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -63,6 +130,13 @@ class TranslationEvaluatorQt(QMainWindow):
         self.filepath = None
         
         self.model_widgets = []
+        
+        # Track the randomized display order: maps display index -> actual model index
+        # e.g., [1, 0] means display slot 0 shows Model 2, slot 1 shows Model 1
+        self.display_order = [0, 1]
+        
+        # Store original translations for current row (before shuffling)
+        self.current_translations = []
         
         self.init_ui()
     
@@ -162,9 +236,12 @@ class TranslationEvaluatorQt(QMainWindow):
         eng_group.setLayout(eng_layout)
         content_layout.addWidget(eng_group)
         
-        # Arabic translations
-        for i, model in enumerate(MODELS, start=1):
-            group = QGroupBox(f"🌐 Translation {i}: {model}")
+        # Arabic translations - use generic labels (A, B) to hide which model is which
+        display_labels = ["A", "B"]
+        self.translation_groups = []  # Store group boxes to update titles if needed
+        
+        for i, label in enumerate(display_labels):
+            group = QGroupBox(f"🌐 Translation {label}")
             group.setFont(QFont("Segoe UI", 11, QFont.Bold))
             layout = QVBoxLayout()
             
@@ -201,12 +278,21 @@ class TranslationEvaluatorQt(QMainWindow):
             
             group.setLayout(layout)
             content_layout.addWidget(group)
+            self.translation_groups.append(group)
             
             self.model_widgets.append({
-                'model': model,
+                'display_label': label,
                 'text_widget': text_edit,
-                'button_group': button_group
+                'button_group': button_group,
+                'radio_buttons': radio_buttons
             })
+        
+        # Status label for auto-save feedback
+        self.status_label = QLabel("")
+        self.status_label.setFont(QFont("Segoe UI", 10))
+        self.status_label.setStyleSheet("color: #107C10; font-style: italic;")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        content_layout.addWidget(self.status_label)
         
         scroll.setWidget(scroll_content)
         main_layout.addWidget(scroll)
@@ -259,6 +345,9 @@ class TranslationEvaluatorQt(QMainWindow):
         if content_row_num < 1 or content_row_num > self.max_content_rows:
             return
         
+        # Clear status label when loading new row
+        self.status_label.setText("")
+        
         # Excel row: header is row 1, so content starts at row 2
         excel_row_idx = 1 + content_row_num
         self.current_row_idx = excel_row_idx
@@ -277,12 +366,39 @@ class TranslationEvaluatorQt(QMainWindow):
         english = row_data[0] if row_data[0] else "(No source text)"
         self.english_text.setPlainText(english)
         
-        # Arabic translations
-        for i, widget_dict in enumerate(self.model_widgets):
-            translation = row_data[i + 1] if (i + 1) < len(row_data) else ""
+        # Store original translations (Model 1 at index 0, Model 2 at index 1)
+        self.current_translations = [
+            row_data[1] if len(row_data) > 1 else "",
+            row_data[2] if len(row_data) > 2 else ""
+        ]
+        
+        # Randomize display order for this row
+        self.display_order = [0, 1]
+        random.shuffle(self.display_order)
+        
+        # Find LCS matches between the two translations
+        if self.current_translations[0] and self.current_translations[1]:
+            matched_idx_0, matched_idx_1 = find_lcs_words(
+                self.current_translations[0], 
+                self.current_translations[1]
+            )
+        else:
+            matched_idx_0, matched_idx_1 = set(), set()
+        
+        # Display translations in randomized order with LCS highlighting
+        matched_indices_list = [matched_idx_0, matched_idx_1]
+        
+        for display_idx, widget_dict in enumerate(self.model_widgets):
+            actual_model_idx = self.display_order[display_idx]
+            translation = self.current_translations[actual_model_idx]
+            matched_indices = matched_indices_list[actual_model_idx]
             
             if translation:
-                widget_dict['text_widget'].setPlainText(translation)
+                self._set_text_with_highlighting(
+                    widget_dict['text_widget'], 
+                    translation, 
+                    matched_indices
+                )
             else:
                 widget_dict['text_widget'].setPlainText("(No translation)")
         
@@ -291,77 +407,124 @@ class TranslationEvaluatorQt(QMainWindow):
         
         # Update info
         self.info_label.setText(
-            f"Sheet: {self.current_sheet.title} | Content Row: {content_row_num}/{self.max_content_rows} | Excel Row: {excel_row_idx}"
+            f"Sheet: {self.current_sheet.title} | Row: {content_row_num}/{self.max_content_rows} | Excel Row: {excel_row_idx}"
         )
     
-    def save_scores(self):
+    def _set_text_with_highlighting(self, text_widget, text, matched_word_indices):
+        """
+        Set text in widget with LCS-matched words highlighted in dark red.
+        
+        Args:
+            text_widget: QTextEdit widget to set text in
+            text: The full text string
+            matched_word_indices: Set of word indices that should be highlighted
+        """
+        text_widget.clear()
+        
+        words = text.split()
+        word_positions = get_word_positions(text)
+        
+        # Create format for highlighted (matched) words - dark red
+        highlight_format = QTextCharFormat()
+        highlight_format.setForeground(QColor("#8B0000"))  # Dark red
+        highlight_format.setFontWeight(QFont.Bold)
+        
+        # Create format for normal words
+        normal_format = QTextCharFormat()
+        normal_format.setForeground(QColor("#000000"))  # Black
+        
+        cursor = text_widget.textCursor()
+        
+        last_pos = 0
+        for word_idx, (start, end) in enumerate(word_positions):
+            # Add any whitespace/text before this word
+            if start > last_pos:
+                cursor.insertText(text[last_pos:start], normal_format)
+            
+            # Add the word with appropriate formatting
+            word = text[start:end]
+            if word_idx in matched_word_indices:
+                cursor.insertText(word, highlight_format)
+            else:
+                cursor.insertText(word, normal_format)
+            
+            last_pos = end
+        
+        # Add any remaining text
+        if last_pos < len(text):
+            cursor.insertText(text[last_pos:], normal_format)
+    
+    def save_scores(self, show_message=True):
         if not self.current_sheet or self.current_row_idx is None:
-            QMessageBox.warning(self, "No row", "No row loaded to save scores.")
-            return
+            if show_message:
+                QMessageBox.warning(self, "No row", "No row loaded to save scores.")
+            return False
         
         try:
-            # Read current row data (Source + 2 translations)
-            row_data = []
-            for col in range(1, 4):
-                cell = self.current_sheet.cell(row=self.current_row_idx, column=col)
-                cell_value = cell.value
-                if cell_value is None:
-                    row_data.append("")
-                else:
-                    row_data.append(str(cell_value).strip())
+            english_text = self.english_text.toPlainText()
+            if english_text == "(No source text)":
+                english_text = ""
             
-            english_text = row_data[0] if row_data[0] else ""
-            translations = row_data[1:3]
-            
-            # Get scores from UI
-            scores = []
-            for i, widget_dict in enumerate(self.model_widgets):
+            # Map display scores back to actual model order
+            # display_order[i] tells us which actual model is shown at display position i
+            # So we need to reverse: actual_scores[actual_model_idx] = display_score[display_idx]
+            display_scores = []
+            for widget_dict in self.model_widgets:
                 score = widget_dict['button_group'].checkedId()
-                if score == -1:  # No button selected
+                if score == -1:
                     score = 0
-                scores.append(score)
+                display_scores.append(score)
             
-            print(f"DEBUG: Saving scores {scores} for models {MODELS}")
-            print(f"DEBUG: English text: {english_text[:50]}...")
-            print(f"DEBUG: Translations: {[t[:50] if t else 'EMPTY' for t in translations]}")
+            # Convert display scores to actual model scores
+            actual_scores = [0, 0]
+            for display_idx, actual_model_idx in enumerate(self.display_order):
+                actual_scores[actual_model_idx] = display_scores[display_idx]
             
-            # Save to JSON files only
-            self._save_to_json(english_text, translations, scores)
-            print("DEBUG: JSON files saved successfully")
+            # Save to JSON files with actual model order
+            self._save_to_json(english_text, self.current_translations, actual_scores)
             
-            QMessageBox.information(self, "Saved", f"Scores saved to JSON files")
+            if show_message:
+                QMessageBox.information(self, "Saved", f"Scores saved to JSON files")
+            
+            return True
             
         except Exception as e:
             import traceback
             error_details = f"Failed to save scores:\n{str(e)}\n\nFull traceback:\n{traceback.format_exc()}"
             print(error_details)
-            QMessageBox.critical(self, "Error", error_details)
+            if show_message:
+                QMessageBox.critical(self, "Error", error_details)
+            return False
     
     def _load_scores_from_json(self, row_index):
-        """Load existing scores from JSON files if available."""
+        """Load existing scores from JSON files if available, mapping to current display order."""
         sheet_name = self.current_sheet.title
+        
+        # First reset all to 0
+        for widget_dict in self.model_widgets:
+            widget_dict['button_group'].button(0).setChecked(True)
         
         if os.path.exists(DETAILED_COMMENTS_FILE):
             with open(DETAILED_COMMENTS_FILE, 'r', encoding='utf-8') as f:
                 detailed_comments = json.load(f)
             
-            # Find scores for this row
+            # Build a map of model -> score for this row
+            model_scores_map = {}
             for entry in detailed_comments:
                 if entry.get('sheet') == sheet_name and entry.get('row_index') == row_index:
                     model = entry.get('model')
                     score = entry.get('score', 0)
-                    
-                    # Find the widget for this model
-                    for widget_dict in self.model_widgets:
-                        if widget_dict['model'] == model:
-                            button = widget_dict['button_group'].button(score)
-                            if button:
-                                button.setChecked(True)
-                            break
-        else:
-            # No saved scores, reset to 0
-            for widget_dict in self.model_widgets:
-                widget_dict['button_group'].button(0).setChecked(True)
+                    model_scores_map[model] = score
+            
+            # Apply scores to widgets based on current display order
+            # display_order[display_idx] = actual_model_idx
+            for display_idx, actual_model_idx in enumerate(self.display_order):
+                model_name = MODELS[actual_model_idx]
+                if model_name in model_scores_map:
+                    score = model_scores_map[model_name]
+                    button = self.model_widgets[display_idx]['button_group'].button(score)
+                    if button:
+                        button.setChecked(True)
     
     def _save_to_json(self, english_text, translations, scores):
         """Save evaluation data to JSON files."""
@@ -473,7 +636,27 @@ class TranslationEvaluatorQt(QMainWindow):
     def next_row(self):
         current = self.row_spin.value()
         if current < self.max_content_rows:
+            # Check if both scores are non-zero for auto-save
+            scores = []
+            for widget_dict in self.model_widgets:
+                score = widget_dict['button_group'].checkedId()
+                if score == -1:
+                    score = 0
+                scores.append(score)
+            
+            # Auto-save if neither score is zero
+            if all(score != 0 for score in scores):
+                if self.save_scores(show_message=False):
+                    self.status_label.setText("✓ Scores auto-saved")
+                    self.status_label.setStyleSheet("color: #107C10; font-style: italic;")
+                    # Clear the message after 2 seconds
+                    QTimer.singleShot(2000, lambda: self.status_label.setText(""))
+            
             self.row_spin.setValue(current + 1)
+    
+    def _clear_status_label(self):
+        """Clear the status label text."""
+        self.status_label.setText("")
 
 
 def main():
