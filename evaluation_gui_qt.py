@@ -38,11 +38,10 @@ except ImportError:
     sys.exit(1)
 
 
+# Model names for the 2 translation columns
 MODELS = [
-    "Tencent LM",
-    "Tencent RAG",
-    "Gemma V2",
-    "Gemma V3"
+    "Model 1",
+    "Model 2"
 ]
 
 # JSON output files
@@ -149,8 +148,8 @@ class TranslationEvaluatorQt(QMainWindow):
         content_layout = QVBoxLayout(scroll_content)
         content_layout.setSpacing(15)
         
-        # English text
-        eng_group = QGroupBox("📝 English Text")
+        # Source text
+        eng_group = QGroupBox("📝 Source Text")
         eng_group.setFont(QFont("Segoe UI", 11, QFont.Bold))
         eng_layout = QVBoxLayout()
         
@@ -266,7 +265,7 @@ class TranslationEvaluatorQt(QMainWindow):
         
         # Read content row
         row_data = []
-        for col in range(1, 6):
+        for col in range(1, 4):
             cell = self.current_sheet.cell(row=excel_row_idx, column=col)
             cell_value = cell.value
             if cell_value is None:
@@ -274,8 +273,8 @@ class TranslationEvaluatorQt(QMainWindow):
             else:
                 row_data.append(str(cell_value).strip())
         
-        # English text
-        english = row_data[0] if row_data[0] else "(No English text)"
+        # Source text
+        english = row_data[0] if row_data[0] else "(No source text)"
         self.english_text.setPlainText(english)
         
         # Arabic translations
@@ -315,9 +314,9 @@ class TranslationEvaluatorQt(QMainWindow):
         try:
             score_row_idx = self.current_row_idx + 1
             
-            # Read current row data (English + 4 translations)
+            # Read current row data (Source + 2 translations)
             row_data = []
-            for col in range(1, 6):
+            for col in range(1, 4):
                 cell = self.current_sheet.cell(row=self.current_row_idx, column=col)
                 cell_value = cell.value
                 if cell_value is None:
@@ -326,25 +325,31 @@ class TranslationEvaluatorQt(QMainWindow):
                     row_data.append(str(cell_value).strip())
             
             english_text = row_data[0] if row_data[0] else ""
-            translations = row_data[1:5]
+            translations = row_data[1:3]
             
-            # Save scores to Excel
+            # Get scores from UI
             scores = []
             for i, widget_dict in enumerate(self.model_widgets):
                 score = widget_dict['button_group'].checkedId()
-                cell = self.current_sheet.cell(row=score_row_idx, column=i + 2)
-                cell.value = score
+                if score == -1:  # No button selected
+                    score = 0
                 scores.append(score)
             
-            self.wb.save(str(self.filepath))
+            print(f"DEBUG: Saving scores {scores} for models {MODELS}")
+            print(f"DEBUG: English text: {english_text[:50]}...")
+            print(f"DEBUG: Translations: {[t[:50] if t else 'EMPTY' for t in translations]}")
             
-            # Save to JSON files
+            # Save to JSON files only
             self._save_to_json(english_text, translations, scores)
+            print("DEBUG: JSON files saved successfully")
             
-            QMessageBox.information(self, "Saved", f"Scores saved to row {score_row_idx} and JSON files updated")
+            QMessageBox.information(self, "Saved", f"Scores saved to JSON files")
             
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to save scores:\n{e}")
+            import traceback
+            error_details = f"Failed to save scores:\n{str(e)}\n\nFull traceback:\n{traceback.format_exc()}"
+            print(error_details)
+            QMessageBox.critical(self, "Error", error_details)
     
     def _save_to_json(self, english_text, translations, scores):
         """Save evaluation data to JSON files."""
@@ -374,10 +379,12 @@ class TranslationEvaluatorQt(QMainWindow):
             with open(MODEL_SCORES_FILE, 'r', encoding='utf-8') as f:
                 model_scores = json.load(f)
         else:
-            model_scores = {
-                model: {"total_score": 0, "count": 0, "average": 0.0, "comments_count": 0}
-                for model in MODELS
-            }
+            model_scores = {}
+        
+        # Ensure all current models exist in the dictionary
+        for model in MODELS:
+            if model not in model_scores:
+                model_scores[model] = {"total_score": 0, "count": 0, "average": 0.0, "comments_count": 0}
         
         # Check if this row was already scored (to avoid double-counting)
         # We'll track by loading detailed_comments and checking
@@ -420,10 +427,10 @@ class TranslationEvaluatorQt(QMainWindow):
         
         # If already counted, recalculate totals from detailed_comments
         if already_counted:
-            model_scores = {
-                model: {"total_score": 0, "count": 0, "average": 0.0, "comments_count": 0}
-                for model in MODELS
-            }
+            model_scores = {}
+            for model in MODELS:
+                model_scores[model] = {"total_score": 0, "count": 0, "average": 0.0, "comments_count": 0}
+            
             for entry in detailed_comments:
                 model = entry.get('model')
                 score = entry.get('score', 0)
